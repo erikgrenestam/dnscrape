@@ -20,6 +20,8 @@ BASE_URL = "https://www.nationalbanken.dk"
 START_URL = "https://www.nationalbanken.dk/da/soeg-i-vidensarkivet"
 DOCS_DIR = "docs"
 METADATA_FILE = "docs_metadata.json"
+MAX_PAGES_TO_SCRAPE = 1
+
 
 # Global WebDriver instance
 _driver = None
@@ -31,20 +33,19 @@ def init_selenium_driver():
         chrome_options = ChromeOptions()
         chrome_options.add_argument("--headless")  # Run headless
         chrome_options.add_argument("--disable-gpu")
-        #chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument('--disable-notifications')
         #chrome_options.add_argument("--window-size=1920,1080") # Standard window size
         #chrome_options.add_argument("--start-maximized") # Make window maximized
         #chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-        chrome_options.add_experimental_option("detach", True) # Keep browser open for debugging
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"]) # Make it less obvious it's automated
+        #chrome_options.add_experimental_option("detach", True) # Keep browser open for debugging
+        #chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"]) # Make it less obvious it's automated
         try:
             # Initialize ChromeDriverManager
             chrome_driver_path = ChromeDriverManager().install()
             service = ChromeService(chrome_driver_path)
             _driver = webdriver.Chrome(service=service, options=chrome_options)
-            _driver.set_window_position(0, 0) # Position window at top-left
             print("Selenium WebDriver initialized successfully.")
         except Exception as e:
             print(f"Error initializing Selenium WebDriver: {e}")
@@ -295,7 +296,7 @@ def download_pdf(pdf_url, filename):
             print(
                 f"File {safe_filename} already exists and MD5 matches. Skipping download."
             )
-            return True
+            return existing_md5
         else:
             print(
                 f"File {safe_filename} exists but MD5 does not match or MD5 file missing. "
@@ -324,13 +325,14 @@ def download_pdf(pdf_url, filename):
             with open(md5_filepath, "w", encoding="utf-8") as f:
                 f.write(md5_hash)
             print(f"MD5 hash saved to {md5_filepath}")
-        return True
+
+        return md5_hash
     except requests.exceptions.RequestException as e:
         print(f"Error downloading {pdf_url}: {e}")
-        return False
+        return None
     except IOError as e:
         print(f"Error writing file {filepath}: {e}")
-        return False
+        return None
 
 def analyze_shadow_dom_structure(driver):
     '''Analyze the shadow DOM structure of the current page and print useful information'''
@@ -555,6 +557,42 @@ def extract_pdf_links_from_shadow_dom(driver):
     print(f"After filtering: {len(pdf_links)} PDF links.")
     return pdf_links
 
+def extract_pdf_links_from_custom_elements(driver):
+    pdf_links = []
+    script = '''
+        // Find all elements with a 'link' attribute (e.g., dnb-related-card)
+        let results = [];
+        function extractFromNode(node) {
+            if (!node || !node.querySelectorAll) return;
+            const all = node.querySelectorAll('[link]');
+            for (const el of all) {
+                let linkAttr = el.getAttribute('link');
+                if (linkAttr) {
+                    try {
+                        let linkObj = JSON.parse(linkAttr);
+                        if (linkObj && linkObj.url && linkObj.url.toLowerCase().endsWith('.pdf')) {
+                            results.push({
+                                href: linkObj.url,
+                                text: el.getAttribute('name') || el.getAttribute('header') || null,
+                                hostTag: el.tagName
+                            });
+                        }
+                    } catch (e) {}
+                }
+            }
+            // Search shadow roots recursively
+            const elements = node.querySelectorAll('*');
+            for (const el of elements) {
+                if (el.shadowRoot) {
+                    extractFromNode(el.shadowRoot);
+                }
+            }
+        }
+        extractFromNode(document);
+        return results;
+    '''
+    return driver.execute_script(script)
+
 def save_metadata_per_page(metadata, page_num):
     '''Saves the current metadata to a JSON file with page number in the filename'''
     if not metadata:
@@ -573,14 +611,14 @@ def save_metadata_per_page(metadata, page_num):
     except Exception as e:
         print(f"Error saving metadata for page {page_num}: {e}")
 
+
 def main():
     if not os.path.exists(DOCS_DIR):
         os.makedirs(DOCS_DIR)
 
     all_metadata = []
     processed_article_urls = set()
-    page_num = 32
-    max_pages_to_scrape = 130 # Safety break for testing, adjust as needed
+    page_num = 1
     first_page = True
 
     try:
@@ -590,8 +628,8 @@ def main():
             return
             
         while True:
-            if page_num > max_pages_to_scrape:
-                print(f"Reached max page limit ({max_pages_to_scrape}), stopping.")
+            if page_num > MAX_PAGES_TO_SCRAPE:
+                print(f"Reached max page limit ({MAX_PAGES_TO_SCRAPE}), stopping.")
                 break
 
             current_search_url = f"{START_URL}?page={page_num}" if page_num > 1 else START_URL
@@ -685,7 +723,6 @@ def main():
                 
                 # Analyze the shadow DOM structure to better understand the page
                 shadow_structure = analyze_shadow_dom_structure(driver)
-                driver.get_screenshot_as_file(f"article_page_{len(processed_article_urls)}.png")
                 
                 # First try to use the PDF links we found from our shadow DOM analysis
                 pdf_links = []
@@ -732,41 +769,54 @@ def main():
                                 pdf_links = pdf_links_in_shadow
                                 break
                 
-                print(f"    Found {len(pdf_links)} potential PDF links")
-                  # Process PDF links
+                print(f"Found {len(pdf_links)} potential PDF links")
+                
+                # --- NEW: Extract PDF links from custom elements ---
+                custom_pdf_links = extract_pdf_links_from_custom_elements(driver)
+                
+                # --- Merge PDF links from all sources ---
+                all_pdf_links = []
+                # Add links from shadow DOM analysis
+                if pdf_links:
+                    all_pdf_links.extend(pdf_links)
+                # Add links from custom elements, but avoid duplicates
+                if custom_pdf_links:
+                    for link in custom_pdf_links:
+                        # Only add if not already present (by href)
+                        href = link.get('href')
+                        if href and not any((isinstance(l, dict) and l.get('href') == href) or (hasattr(l, 'get_attribute') and l.get_attribute('href') == href) for l in all_pdf_links):
+                            all_pdf_links.append(link)
+
+                print(f"Found {len(all_pdf_links)} total potential PDF links")
+
                 pdf_found_for_article = False
-                for pdf_link in pdf_links:
+                for pdf_link in all_pdf_links:
                     try:
-                        # Handle both WebElements and our custom dictionary objects
                         pdf_href = None
-                        
-                        # If it's a dictionary from our shadow DOM analysis
+                        # If it's a dictionary from our shadow DOM analysis or custom element
                         if isinstance(pdf_link, dict) and 'href' in pdf_link:
                             pdf_href = pdf_link['href']
-                            print(f"    Processing PDF link from shadow analysis: {pdf_href}")
+                            print(f"Processing PDF link: {pdf_href}")
                         # If it's a regular WebElement
                         elif hasattr(pdf_link, 'get_attribute'):
                             pdf_href = pdf_link.get_attribute('href')
                             if not pdf_href:
-                                # Try with JavaScript to get href from shadow DOM element
                                 pdf_href = driver.execute_script("return arguments[0].href || arguments[0].getAttribute('href');", pdf_link)
-                        # If it's something else, try JavaScript as a last resort
                         else:
                             try:
                                 pdf_href = driver.execute_script("return arguments[0].href || arguments[0].getAttribute('href');", pdf_link)
-                            except:
+                            except Exception:
                                 print(f"    Cannot extract href from {type(pdf_link)}")
-                        
                         if pdf_href and pdf_href.lower().endswith(".pdf"):
                             full_pdf_url = urljoin(BASE_URL, pdf_href)
                             parsed_pdf_url = urlparse(full_pdf_url)
                             pdf_filename = os.path.basename(parsed_pdf_url.path)
-                            
                             if not pdf_filename:
                                 print(f"    Could not determine filename for PDF: {full_pdf_url}")
                                 continue
                             print(f"    Found PDF: {full_pdf_url}")
-                            if download_pdf(full_pdf_url, pdf_filename):
+                            md5_hash = download_pdf(full_pdf_url, pdf_filename)
+                            if md5_hash:
                                 metadata = {
                                     "source_page_url": article_url,
                                     "pdf_url": full_pdf_url,
@@ -775,7 +825,8 @@ def main():
                                     "date": article['date'],
                                     "content_type": article['content_type'],
                                     "topic": article['topic'],
-                                    "description": article['description']
+                                    "description": article['description'],
+                                    "file_md5": md5_hash
                                 }
                                 all_metadata.append(metadata)
                                 page_metadata.append(metadata)
@@ -786,15 +837,19 @@ def main():
                         print(f"    Error processing PDF link: {e}")
                         import traceback
                         traceback.print_exc()
-                
                 if not pdf_found_for_article:
-                    print(f"    No PDF download link found on article page: {article_url}")
+                    print(
+                        "    No PDF download link found on article page: "
+                        f"{article_url}"
+                    )
             
             # Save metadata for this page
             save_metadata_per_page(page_metadata, page_num)
             
             if not found_new_articles_on_page and page_num > 1:
-                print("No new articles found on this page, stopping pagination.")
+                print(
+                    "No new articles found on this page, stopping pagination."
+                )
                 break
             
             page_num += 1
@@ -807,14 +862,21 @@ def main():
     finally:
         # Save metadata
         if all_metadata:
+            print(
+                "Metadata for {} PDFs saved to {}".format(
+                    len(all_metadata), METADATA_FILE
+                )
+            )
             with open(METADATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(all_metadata, f, indent=4, ensure_ascii=False)
-            print(f"Metadata for {len(all_metadata)} PDFs saved to {METADATA_FILE}")
         else:
             print("No PDFs were downloaded, so no metadata file created.")
         
         # Keep browser open for debugging
-        print("Browser window left open for inspection. Close it manually when done.")
+        print(
+            "Browser window left open for inspection. "
+            "Close it manually when done."
+        )
 
 if __name__ == "__main__":
     main()
