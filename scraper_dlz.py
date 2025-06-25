@@ -9,24 +9,41 @@ import requests
 from urllib.parse import urljoin, urlparse
 from dlz_tools import DLZ
 dlz = DLZ()
-dlz.send_user_script_info(f"Updating Chrome...")
+dlz.send_user_script_info("Updating Chrome...")
 os.system("""
-            apt-get update \
+        apt-get update \
             && apt-get install -y \
             curl \
             gnupg \
             unzip \
             wget \
+            jq \
             --no-install-recommends \
-            && curl -sSL https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
-            && echo "deb https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-            && apt-get update && apt-get install -y \
-            google-chrome-stable \
-            --no-install-recommends \
-            && wget -O /tmp/chromedriver.zip http://chromedriver.storage.googleapis.com/`curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE`/chromedriver_linux64.zip \
-            && unzip -o /tmp/chromedriver.zip chromedriver -d /usr/local/bin/ \
-            && rm -rf /tmp/* \
-            && rm -rf /var/lib/apt/lists/* 
+            && rm -rf /var/lib/apt/lists/*
+
+        # Get the latest stable Chrome and ChromeDriver versions
+        LATEST_STABLE_URL="https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+
+        # Download the JSON file and parse it for the linux64 chrome and chromedriver URLs
+        CHROME_URL=$(curl -s $LATEST_STABLE_URL | jq -r '.channels.Stable.downloads.chrome[] | select(.platform=="linux64") | .url')
+        CHROMEDRIVER_URL=$(curl -s $LATEST_STABLE_URL | jq -r '.channels.Stable.downloads.chromedriver[] | select(.platform=="linux64") | .url')
+
+        # Download and unzip Chrome for Testing
+        wget -O /tmp/chrome-linux64.zip $CHROME_URL \
+            && unzip -o /tmp/chrome-linux64.zip -d /tmp/ \
+            && mv /tmp/chrome-linux64/* /usr/bin/
+
+        # Install dependencies for Chrome
+        apt-get update && \
+        while read -r pkg; do \
+        apt-get satisfy -y --no-install-recommends "${pkg}"; \
+        done < /usr/bin/deb.deps;
+
+        # Download and unzip ChromeDriver
+        wget -O /tmp/chromedriver-linux64.zip $CHROMEDRIVER_URL \
+            && unzip -o /tmp/chromedriver-linux64.zip -d /tmp/ \
+            && mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/ \
+            && rm -rf /tmp/*
         """)
 
 dlz.send_user_script_info("pip installing...")
@@ -44,7 +61,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-class NationalBankenScraper:
+class NationalbankenScraper:
     """
     A scraper for downloading PDF documents from nationalbanken.dk.
     It handles shadow DOM, accepts cookies, and downloads files with metadata.
@@ -513,37 +530,37 @@ class NationalBankenScraper:
 
     def extract_pdf_links_from_custom_elements(self):
         script = '''
-        // Find all elements with a 'link' attribute (e.g., dnb-related-card)
-        let results = [];
-        function extractFromNode(node) {
-            if (!node || !node.querySelectorAll) return;
-            const all = node.querySelectorAll('[link]');
-            for (const el of all) {
-                let linkAttr = el.getAttribute('link');
-                if (linkAttr) {
-                    try {
-                        let linkObj = JSON.parse(linkAttr);
-                        if (linkObj && linkObj.url && linkObj.url.toLowerCase().endsWith('.pdf')) {
-                            results.push({
-                                href: linkObj.url,
-                                text: el.getAttribute('name') || el.getAttribute('header') || null,
-                                hostTag: el.tagName
-                            });
-                        }
-                    } catch (e) {}
+            // Find all elements with a 'link' attribute (e.g., dnb-related-card)
+            let results = [];
+            function extractFromNode(node) {
+                if (!node || !node.querySelectorAll) return;
+                const all = node.querySelectorAll('[link]');
+                for (const el of all) {
+                    let linkAttr = el.getAttribute('link');
+                    if (linkAttr) {
+                        try {
+                            let linkObj = JSON.parse(linkAttr);
+                            if (linkObj && linkObj.url && linkObj.url.toLowerCase().endsWith('.pdf')) {
+                                results.push({
+                                    href: linkObj.url,
+                                    text: el.getAttribute('name') || el.getAttribute('header') || null,
+                                    hostTag: el.tagName
+                                });
+                            }
+                        } catch (e) {}
+                    }
+                }
+                // Search shadow roots recursively
+                const elements = node.querySelectorAll('*');
+                for (const el of elements) {
+                    if (el.shadowRoot) {
+                        extractFromNode(el.shadowRoot);
+                    }
                 }
             }
-            // Search shadow roots recursively
-            const elements = node.querySelectorAll('*');
-            for (const el of elements) {
-                if (el.shadowRoot) {
-                    extractFromNode(el.shadowRoot);
-                }
-            }
-        }
-        extractFromNode(document);
-        return results;
-    '''
+            extractFromNode(document);
+            return results;
+        '''
         return self.driver.execute_script(script)
 
     def save_metadata_per_page(self, metadata, page_num):
@@ -825,7 +842,7 @@ class NationalBankenScraper:
 
 def main():
     """Main function to run the scraper."""
-    with NationalBankenScraper(dlz) as scraper:
+    with NationalbankenScraper(dlz) as scraper:
         files_to_send = scraper.run()
 
     if files_to_send:
