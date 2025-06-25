@@ -28,7 +28,7 @@ os.system("""
             && rm -rf /var/lib/apt/lists/* 
         """)
 
-dlz.send_user_script_info(f"pip installing...")
+dlz.send_user_script_info("pip installing...")
 dlz.pip_install("selenium>=4.0.0")
 dlz.pip_install("webdriver-manager>=4.0.0")
 dlz.pip_install("requests>=2.32.3")
@@ -286,7 +286,7 @@ def extract_attributes_from_shadow_element(driver, element):
         print(f"Error extracting attributes: {e}")
         return {}
 
-def download_pdf(pdf_url, filename):
+def download_pdf(pdf_url, filename, sent_files=None):
     '''Downloads a PDF from a URL to a local file, saves an MD5 file, and skips download if file with matching MD5 exists.'''
     import hashlib
     if not os.path.exists(DOCS_DIR):
@@ -323,6 +323,8 @@ def download_pdf(pdf_url, filename):
             print(
                 f"File {safe_filename} already exists and MD5 matches. Skipping download."
             )
+            if sent_files is not None:
+                sent_files.extend([filepath, md5_filepath])
             return existing_md5
         else:
             print(
@@ -352,11 +354,8 @@ def download_pdf(pdf_url, filename):
             with open(md5_filepath, "w", encoding="utf-8") as f:
                 f.write(md5_hash)
             print(f"MD5 hash saved to {md5_filepath}")
-
-        dlz.send_user_script_info(f"Sending {filepath}")
-        dlz.send_file_created(filepath)
-        dlz.send_file_created(md5_filepath)
-
+        if sent_files is not None:
+            sent_files.extend([filepath, md5_filepath])
         return md5_hash
     except requests.exceptions.RequestException as e:
         print(f"Error downloading {pdf_url}: {e}")
@@ -370,7 +369,7 @@ def analyze_shadow_dom_structure(driver):
     print("\nAnalyzing shadow DOM structure of current page...")
     
     # Execute JavaScript to recursively inspect all shadow roots and return useful information
-    structure = driver.execute_script("""
+    structure = driver.execute_script(r"""
         // Track all shadow DOM roots
         const shadowRoots = [];
         
@@ -493,7 +492,7 @@ def extract_pdf_links_from_shadow_dom(driver):
     Returns a list of dictionaries with href and other properties.'''
     print("Extracting PDF links from shadow DOM with specialized JavaScript...")
     
-    script = """
+    script = r"""
         // Track all PDF links
         const pdfLinks = [];
         
@@ -624,7 +623,7 @@ def extract_pdf_links_from_custom_elements(driver):
     '''
     return driver.execute_script(script)
 
-def save_metadata_per_page(metadata, page_num):
+def save_metadata_per_page(metadata, page_num, sent_files=None):
     '''Saves the current metadata to a JSON file with page number in the filename'''
     if not metadata:
         print(f"No metadata to save for page {page_num}")
@@ -642,8 +641,8 @@ def save_metadata_per_page(metadata, page_num):
     except Exception as e:
         print(f"Error saving metadata for page {page_num}: {e}")
 
-    dlz.send_user_script_info(f"Sending {metadata_filename}")
-    dlz.send_file_created(metadata_filename)
+    if sent_files is not None:
+        sent_files.append(metadata_filename)
 
 def main():
     if not os.path.exists(DOCS_DIR):
@@ -653,12 +652,13 @@ def main():
     processed_article_urls = set()
     page_num = 1
     first_page = True
+    sent_files = []
 
     try:
         driver = init_selenium_driver()
         if not driver:
             dlz.send_user_script_info("Failed to initialize WebDriver. Exiting.")
-            return
+            return []
             
         while True:
             if page_num > MAX_PAGES_TO_SCRAPE:
@@ -720,7 +720,7 @@ def main():
                 
                 # If no URL found, skip this item
                 if not article_url:
-                    dlz.send_user_script_info(f"  Could not find a valid URL for item: {article_title}")
+                    print(f"Could not find a valid URL for item: {article_title}")
                     continue
                 
                 # Skip if already processed
@@ -738,7 +738,9 @@ def main():
                     'description': description
                 })
                 found_new_articles_on_page = True
-            
+
+                dlz.send_user_script_info(f"Articles found on page: {[a['article_url'] for a in page_articles]}")
+
             # Now visit each article URL one by one
             for article in page_articles:
                 article_url = article['url']
@@ -762,7 +764,7 @@ def main():
                 pdf_links_from_analysis = shadow_structure.get('pdfLinks', [])
                 
                 if pdf_links_from_analysis:
-                    print(f"    Found {len(pdf_links_from_analysis)} PDF links from shadow DOM analysis")
+                    #print(f"Found {len(pdf_links_from_analysis)} PDF links from shadow DOM analysis")
                     
                     # Convert the analyzed links to objects that can be used like WebElements
                     for link_info in pdf_links_from_analysis:
@@ -778,16 +780,12 @@ def main():
                 
                 # If no PDF links found through analysis, try regular DOM
                 if not pdf_links:
-                    dlz.send_user_script_info("    No PDF links found in shadow DOM analysis, trying regular DOM...")
                     regular_pdf_links = driver.find_elements(By.CSS_SELECTOR, "a.related-card__link[download], a[href$='.pdf']")
                     
                     if regular_pdf_links:
                         pdf_links = regular_pdf_links
                     else:
                         # If still nothing found, try our custom shadow DOM search
-                        dlz.send_user_script_info("    No PDF links found in regular DOM, searching in shadow DOM...")
-                        
-                        # Try selectors in order of specificity
                         shadow_selectors = [
                             "a.related-card__link[download]",
                             "a.related-card__link[href$='.pdf']",
@@ -802,20 +800,13 @@ def main():
                                 pdf_links = pdf_links_in_shadow
                                 break
                 
-                dlz.send_user_script_info(f"Found {len(pdf_links)} potential PDF links")
-                
-                # --- NEW: Extract PDF links from custom elements ---
                 custom_pdf_links = extract_pdf_links_from_custom_elements(driver)
                 
-                # --- Merge PDF links from all sources ---
                 all_pdf_links = []
-                # Add links from shadow DOM analysis
                 if pdf_links:
                     all_pdf_links.extend(pdf_links)
-                # Add links from custom elements, but avoid duplicates
                 if custom_pdf_links:
                     for link in custom_pdf_links:
-                        # Only add if not already present (by href)
                         href = link.get('href')
                         if href and not any((isinstance(l, dict) and l.get('href') == href) or (hasattr(l, 'get_attribute') and l.get_attribute('href') == href) for l in all_pdf_links):
                             all_pdf_links.append(link)
@@ -826,11 +817,9 @@ def main():
                 for pdf_link in all_pdf_links:
                     try:
                         pdf_href = None
-                        # If it's a dictionary from our shadow DOM analysis or custom element
                         if isinstance(pdf_link, dict) and 'href' in pdf_link:
                             pdf_href = pdf_link['href']
                             print(f"Processing PDF link: {pdf_href}")
-                        # If it's a regular WebElement
                         elif hasattr(pdf_link, 'get_attribute'):
                             pdf_href = pdf_link.get_attribute('href')
                             if not pdf_href:
@@ -845,10 +834,10 @@ def main():
                             parsed_pdf_url = urlparse(full_pdf_url)
                             pdf_filename = os.path.basename(parsed_pdf_url.path)
                             if not pdf_filename:
-                                print(f"    Could not determine filename for PDF: {full_pdf_url}")
+                                print(f"Could not determine filename for PDF: {full_pdf_url}")
                                 continue
-                            print(f"    Found PDF: {full_pdf_url}")
-                            md5_hash = download_pdf(full_pdf_url, pdf_filename)
+                            print(f"Found PDF: {full_pdf_url}")
+                            md5_hash = download_pdf(full_pdf_url, pdf_filename, sent_files=sent_files)
                             if md5_hash:
                                 metadata = {
                                     "source_page_url": article_url,
@@ -867,17 +856,14 @@ def main():
                             else:
                                 print(f"    Failed to download {pdf_filename}")
                     except Exception as e:
-                        print(f"    Error processing PDF link: {e}")
-                        import traceback
-                        traceback.print_exc()
+                        dlz.send_user_script_info(f"Error processing PDF link: {e}")
                 if not pdf_found_for_article:
-                    print(
-                        "    No PDF download link found on article page: "
+                    dlz.send_user_script_info(
+                        "No PDF download link found on article page: "
                         f"{article_url}"
                     )
             
-            # Save metadata for this page
-            save_metadata_per_page(page_metadata, page_num)
+            save_metadata_per_page(page_metadata, page_num, sent_files=sent_files)
             
             if not found_new_articles_on_page and page_num > 1:
                 print(
@@ -894,6 +880,7 @@ def main():
         print(f"Unexpected error: {e}")
     finally:
         # Save metadata
+        metadata_file_written = False
         if all_metadata:
             print(
                 "Metadata for {} PDFs saved to {}".format(
@@ -902,14 +889,18 @@ def main():
             )
             with open(METADATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(all_metadata, f, indent=4, ensure_ascii=False)
+            sent_files.append(METADATA_FILE)
+            metadata_file_written = True
         else:
             print("No PDFs were downloaded, so no metadata file created.")
-        
-        # Keep browser open for debugging
         print(
             "Browser window left open for inspection. "
             "Close it manually when done."
         )
+        return sent_files
 
 
-main()
+files_to_send = main()
+for fpath in list(set(files_to_send)):
+    dlz.send_user_script_info(f"Sending file {fpath}")
+    dlz.send_file_created(fpath)
