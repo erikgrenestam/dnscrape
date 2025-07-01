@@ -6,11 +6,15 @@ import time
 import json
 import hashlib
 import requests
+import sys
 from urllib.parse import urljoin, urlparse
+from selenium.common.exceptions import TimeoutException
 #from dlz_tools import DLZ
 #dlz = DLZ()
+
 print("Updating Chrome...")
-os.system("""
+if sys.platform.startswith("linux"):
+    os.system("""
         apt-get update \
             && apt-get install -y \
             curl \
@@ -47,9 +51,9 @@ os.system("""
         """)
 
 print("pip installing...")
-dlz.pip_install("selenium>=4.0.0")
-dlz.pip_install("webdriver-manager>=4.0.0")
-dlz.pip_install("requests>=2.32.3")
+#dlz.pip_install("selenium>=4.0.0")
+#dlz.pip_install("webdriver-manager>=4.0.0")
+#dlz.pip_install("requests>=2.32.3")
 
 
 # Selenium imports
@@ -60,6 +64,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import sys
 
 class NationalbankenScraper:
     """
@@ -105,11 +110,11 @@ class NationalbankenScraper:
                 chrome_options.add_argument("--window-size=1920,1080")
                 
                 # The following two lines are for local debugging, not for DLZ
-                # service = ChromeService(ChromeDriverManager().install())
-                # self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                service = ChromeService(ChromeDriverManager().install())
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
                 
                 # Use this for DLZ environment
-                self.driver = webdriver.Chrome(options=chrome_options)
+                #self.driver = webdriver.Chrome(options=chrome_options)
                 print("WebDriver initialized successfully.")
             except Exception as e:
                 print(f"Error initializing WebDriver: {e}")
@@ -141,71 +146,91 @@ class NationalbankenScraper:
     def find_elements_in_all_shadow_roots(self, shadow_css_selector):
         '''Find elements in all shadow roots recursively using JavaScript.'''
         try:
-            script = f"""
-                let elements = [];
+            # Set a script timeout to prevent freezing
+            self.driver.set_script_timeout(30)  # 30 seconds
+
+            script = f'''
+                const elements = [];
+                const visited = new Set();
+
                 function findInChildren(node) {{
-                    if (!node) return;
+                    if (!node || visited.has(node)) return;
+                    visited.add(node);
+
+                    // Search in the current node's shadow root
                     if (node.shadowRoot) {{
-                        const found = node.shadowRoot.querySelectorAll('{shadow_css_selector}');
-                        elements.push(...found);
-                        // Continue searching in children of the shadow root
+                        try {{
+                            const found = node.shadowRoot.querySelectorAll(`{shadow_css_selector}`);
+                            elements.push(...found);
+                        }} catch (e) {{
+                            console.error(`Error with selector in shadowRoot: {shadow_css_selector}`, e);
+                        }}
+                        // Important: also search inside the shadow root for more shadow hosts
                         findInChildren(node.shadowRoot);
                     }}
+
+                    // Search for shadow hosts in the children of the current node (or shadow root)
                     const children = node.querySelectorAll('*');
                     for (const child of children) {{
-                        findInChildren(child);
+                        if (child.shadowRoot) {{
+                            findInChildren(child);
+                        }}
                     }}
                 }}
+
                 findInChildren(document);
                 return elements;
-            """
+            '''
             elements = self.driver.execute_script(script)
             print(f"Found {len(elements)} elements in all shadow roots with selector: {shadow_css_selector}")
             return elements
+        except TimeoutException:
+            print(f"Timeout while searching for elements with selector: {shadow_css_selector}")
+            return []
         except Exception as e:
             print(f"Error finding elements in shadow roots: {e}")
             return []
 
     def accept_cookies(self):
-        '''Accepts cookies by clicking the "Allow all cookies" button if it's present.'''
+        '''Accepts cookies by clicking the "Allow all cookies" button if it's present.
+        Handles both normal DOM and shadow DOM elements.'''
         try:
             print("Looking for cookie consent dialog...")
             
             # First check regular DOM
             try:
-                cookie_button = WebDriverWait(self.driver, 10).until(
-                    EC.element_to_be_clickable((By.ID, "coiPage-1-allowall"))
+                # Wait for regular cookie dialog (shorter timeout)
+                cookie_button = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"))
                 )
-                cookie_button.click()
-                print("Clicked cookie button in regular DOM.")
-                time.sleep(2)
+                print("Cookie dialog found in regular DOM. Accepting cookies...")
+                
+                # Take screenshot before clicking
+                self.driver.get_screenshot_as_file("before_cookie_click.png")
+                
+                # Try JavaScript click for reliability
+                self.driver.execute_script("arguments[0].click();", cookie_button)
+                print("Cookie accept button clicked.")
+
+                # Wait for the dialog to disappear
+                print("Waiting for cookie dialog to disappear...")
+                WebDriverWait(self.driver, 10).until(
+                    EC.invisibility_of_element_located((By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"))
+                )
+                print("Cookie dialog disappeared from regular DOM.")
+                
             except Exception as dom_error:
-                print(f"Cookie button not found in regular DOM: {dom_error}. Trying shadow DOM.")
-                # If not found, try to find it in a shadow DOM
-                found_in_shadow = False
-                shadow_hosts = self.driver.find_elements(By.CSS_SELECTOR, '*')
-                for host in shadow_hosts:
-                    try:
-                        button = self.find_in_shadow_root(f"#{host.get_attribute('id')}", "#coiPage-1-allowall")
-                        if button:
-                            button.click()
-                            print("Clicked cookie button in shadow DOM.")
-                            found_in_shadow = True
-                            break
-                    except Exception:
-                        continue
-                if not found_in_shadow:
-                    print("Cookie consent button not found in shadow DOM either.")
+                print(f"Cookie dialog not found in regular DOM: {dom_error}")
+                #print("Checking for cookie dialog in shadow DOM...")
             
+            # Wait for the page to stabilize before taking the screenshot
+            time.sleep(1) 
+
             # Take a screenshot after clicking
             self.driver.get_screenshot_as_file("after_cookie_click.png")
             
-            # Wait for the cookie banner to disappear
-            print("Waiting for cookie banner to disappear...")
-            WebDriverWait(self.driver, 10).until(
-                EC.invisibility_of_element_located((By.ID, "coiPage-1-allowall"))
-            )
-            print("Cookie banner disappeared.")
+            # Wait for dialog to disappear and page to stabilize
+            time.sleep(2)
             return True
         
         except Exception as e:
