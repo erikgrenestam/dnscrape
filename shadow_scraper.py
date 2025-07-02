@@ -6,9 +6,8 @@ import time
 import json
 import hashlib
 import requests
-import sys
-from urllib.parse import urljoin, urlparse
-from selenium.common.exceptions import TimeoutException
+import subprocess
+import shlex
 
 try:
     from dlz_tools import DLZ
@@ -18,50 +17,94 @@ except ImportError:
     ON_DLZ = False
     dlz = None
 
-print("Updating Chrome...")
-if sys.platform.startswith("linux") and ON_DLZ:
-    os.system("""
-        apt-get update \
-            && apt-get install -y \
-            curl \
-            gnupg \
-            unzip \
-            wget \
-            jq \
-            --no-install-recommends \
-            && rm -rf /var/lib/apt/lists/*
 
-        # Get the latest stable Chrome and ChromeDriver versions
-        LATEST_STABLE_URL="https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+def print_dlz(s: str):
+    if ON_DLZ:
+        dlz.send_user_script_info(s)
+    else:
+        print(s)
 
-        # Download the JSON file and parse it for the linux64 chrome and chromedriver URLs
-        CHROME_URL=$(curl -s $LATEST_STABLE_URL | jq -r '.channels.Stable.downloads.chrome[] | select(.platform=="linux64") | .url')
-        CHROMEDRIVER_URL=$(curl -s $LATEST_STABLE_URL | jq -r '.channels.Stable.downloads.chromedriver[] | select(.platform=="linux64") | .url')
 
-        # Download and unzip Chrome for Testing
-        wget -O /tmp/chrome-linux64.zip $CHROME_URL \
-            && unzip -o /tmp/chrome-linux64.zip -d /tmp/ \
-            && mv /tmp/chrome-linux64/* /usr/bin/
+if ON_DLZ:
+    print_dlz("Running on DLZ")
 
-        # Install dependencies for Chrome
-        apt-get update && \
-        while read -r pkg; do \
-        apt-get satisfy -y --no-install-recommends "${pkg}"; \
-        done < /usr/bin/deb.deps;
+print_dlz("Updating Chrome...")
+if ON_DLZ:
+    script = """
+    #!/bin/bash
+    set -e
 
-        # Download and unzip ChromeDriver
-        wget -O /tmp/chromedriver-linux64.zip $CHROMEDRIVER_URL \
-            && unzip -o /tmp/chromedriver-linux64.zip -d /tmp/ \
-            && mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/ \
-            && rm -rf /tmp/*
-        """)
+    # Install initial dependencies
+    apt-get update && \
+        apt-get install -y \
+        curl \
+        gnupg \
+        unzip \
+        wget \
+        jq \
+        --no-install-recommends && \
+        rm -rf /var/lib/apt/lists/*
 
-print("pip installing...")
+    # Get the latest stable Chrome and ChromeDriver versions
+    LATEST_STABLE_URL="https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+
+    # Download the JSON file once to prevent version mismatches
+    JSON_DATA=$(curl -s $LATEST_STABLE_URL)
+
+    # Parse for the linux64 chrome and chromedriver URLs
+    CHROME_URL=$(echo "$JSON_DATA" | jq -r '.channels.Stable.downloads.chrome[] | select(.platform=="linux64") | .url')
+    CHROMEDRIVER_URL=$(echo "$JSON_DATA" | jq -r '.channels.Stable.downloads.chromedriver[] | select(.platform=="linux64") | .url')
+
+    # Download and unzip Chrome for Testing to /opt
+    wget -O /tmp/chrome-linux64.zip $CHROME_URL
+    unzip -o /tmp/chrome-linux64.zip -d /opt
+
+    # Create a symbolic link to the chrome executable
+    rm -f /usr/bin/google-chrome
+    ln -s /opt/chrome-linux64/chrome /usr/bin/google-chrome
+
+    # Install dependencies for Chrome using the provided .deps file
+    apt-get update
+    while read -r pkg; do
+    apt-get satisfy -y --no-install-recommends "${pkg}";
+    done < /opt/chrome-linux64/deb.deps
+
+    # Download and unzip ChromeDriver
+    wget -O /tmp/chromedriver-linux64.zip $CHROMEDRIVER_URL
+    unzip -o /tmp/chromedriver-linux64.zip -d /tmp/
+    mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/
+
+    # Clean up temporary files
+    rm -rf /tmp/*
+    """
+
+    # Run the script using subprocess
+    try:
+        # 'check=True' will raise a CalledProcessError if the script fails
+        # 'shell=True' is needed to interpret the shell script syntax
+        # 'executable' ensures the script is run with bash
+        result = subprocess.run(
+            script, 
+            shell=True, 
+            check=True, 
+            executable='/bin/bash',
+            capture_output=True, # Optional: if you want to see the output
+            text=True # Optional: decodes output as text
+        )
+        print("Script executed successfully!")
+        print("STDOUT:", result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Script failed with exit code {e.returncode}")
+        print("STDERR:", e.stderr)
+        print("STDOUT:", e.stdout)
+        
+print_dlz("pip installing...")
 
 if ON_DLZ:
     dlz.pip_install("selenium>=4.0.0")
     dlz.pip_install("webdriver-manager>=4.0.0")
     dlz.pip_install("requests>=2.32.3")
+
 
 
 # Selenium imports
@@ -72,13 +115,9 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import sys
+from urllib.parse import urljoin, urlparse
+from selenium.common.exceptions import TimeoutException
 
-def print_dlz(s: str):
-    if ON_DLZ:
-        dlz.send_user_script_info(s)
-    else:
-        print(s)
 
 class NationalbankenScraper:
     """
@@ -88,7 +127,7 @@ class NationalbankenScraper:
     BASE_URL = "https://www.nationalbanken.dk"
     START_URL = "https://www.nationalbanken.dk/da/soeg-i-vidensarkivet"
     DOCS_DIR = "docs"
-    METADATA_FILE = "docs_metadata.json"
+    METADATA_FILE = "docs_metadata.csv"
     MAX_PAGES_TO_SCRAPE = 1
 
     def __init__(self, dlz_instance=None):
@@ -133,7 +172,7 @@ class NationalbankenScraper:
                     self.driver = webdriver.Chrome(options=chrome_options)
                 print_dlz("WebDriver initialized successfully.")
             except Exception as e:
-                print(f"Error initializing WebDriver: {e}")
+                print_dlz(f"Error initializing WebDriver: {e}")
                 self.driver = None
         return self.driver
 
@@ -619,23 +658,41 @@ class NationalbankenScraper:
             with open(metadata_filename, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=4, ensure_ascii=False)
             print_dlz(f"Metadata for page {page_num} saved to {metadata_filename}")
-            self.sent_files.add(metadata_filename)
+            #self.sent_files.add(metadata_filename)
         except Exception as e:
             print(f"Error saving metadata for page {page_num}: {e}")
 
     def _save_final_metadata(self):
-        """Saves the aggregated metadata to the main metadata file."""
+        """Saves the aggregated metadata to a CSV file instead of JSON."""
+        import csv
         if self.all_metadata:
-            print(
+            # Deduplicate by file_md5
+            unique = {}
+            for entry in self.all_metadata:
+                file_md5 = entry.get('file_md5')
+                if file_md5 and file_md5 not in unique:
+                    unique[file_md5] = entry
+            self.all_metadata = list(unique.values())
+
+            csv_file = self.METADATA_FILE
+            # Determine all possible keys for CSV header
+            all_keys = set()
+            for entry in self.all_metadata:
+                all_keys.update(entry.keys())
+            fieldnames = sorted(all_keys)
+            with open(csv_file, "w", encoding="utf-8", newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in self.all_metadata:
+                    writer.writerow(row)
+            self.sent_files.add(csv_file)
+            print_dlz(
                 "Metadata for {} PDFs saved to {}".format(
                     len(self.all_metadata), self.METADATA_FILE
                 )
             )
-            with open(self.METADATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.all_metadata, f, indent=4, ensure_ascii=False)
-            self.sent_files.add(self.METADATA_FILE)
         else:
-            print("No PDFs were downloaded, so no metadata file created.")
+            print_dlz("No PDFs were downloaded, so no metadata file created.")
 
     def run(self):
         """
@@ -652,7 +709,7 @@ class NationalbankenScraper:
 
         try:
             if not self.driver:
-                print("WebDriver not initialized. Exiting.")
+                print_dlz("WebDriver not initialized. Exiting.")
                 return []
                 
             while True:
@@ -858,7 +915,7 @@ class NationalbankenScraper:
                             f"{article_url}"
                         )
                 
-                self.save_metadata_per_page(page_metadata, page_num)
+                #self.save_metadata_per_page(page_metadata, page_num)
                 
                 if not found_new_articles_on_page and page_num > 1:
                     print(
@@ -884,12 +941,14 @@ class NationalbankenScraper:
 def main():
     """Main function to run the scraper."""
     with NationalbankenScraper() as scraper:
-        files_to_send = scraper.run()
+        scraper.run()
+    files_to_send = list(scraper.sent_files)  # Collect after context manager
 
     if files_to_send and ON_DLZ:
         for fpath in files_to_send:
-            print(f"Sending file {fpath}")
+            print_dlz(f"Sending file {fpath}")
             dlz.send_file_created(fpath)
+
 
 #if __name__ == "__main__":
 main()
