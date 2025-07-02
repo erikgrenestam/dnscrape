@@ -9,11 +9,17 @@ import requests
 import sys
 from urllib.parse import urljoin, urlparse
 from selenium.common.exceptions import TimeoutException
-#from dlz_tools import DLZ
-#dlz = DLZ()
+
+try:
+    from dlz_tools import DLZ
+    dlz = DLZ()
+    ON_DLZ = True
+except ImportError:
+    ON_DLZ = False
+    dlz = None
 
 print("Updating Chrome...")
-if sys.platform.startswith("linux"):
+if sys.platform.startswith("linux") and ON_DLZ:
     os.system("""
         apt-get update \
             && apt-get install -y \
@@ -51,9 +57,11 @@ if sys.platform.startswith("linux"):
         """)
 
 print("pip installing...")
-#dlz.pip_install("selenium>=4.0.0")
-#dlz.pip_install("webdriver-manager>=4.0.0")
-#dlz.pip_install("requests>=2.32.3")
+
+if ON_DLZ:
+    dlz.pip_install("selenium>=4.0.0")
+    dlz.pip_install("webdriver-manager>=4.0.0")
+    dlz.pip_install("requests>=2.32.3")
 
 
 # Selenium imports
@@ -65,6 +73,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import sys
+
+def print_dlz(s: str):
+    if ON_DLZ:
+        dlz.send_user_script_info(s)
+    else:
+        print(s)
 
 class NationalbankenScraper:
     """
@@ -110,12 +124,14 @@ class NationalbankenScraper:
                 chrome_options.add_argument("--window-size=1920,1080")
                 
                 # The following two lines are for local debugging, not for DLZ
-                service = ChromeService(ChromeDriverManager().install())
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                if not ON_DLZ:
+                    service = ChromeService(ChromeDriverManager().install())
+                    self.driver = webdriver.Chrome(service=service, options=chrome_options)
                 
                 # Use this for DLZ environment
-                #self.driver = webdriver.Chrome(options=chrome_options)
-                print("WebDriver initialized successfully.")
+                else:
+                    self.driver = webdriver.Chrome(options=chrome_options)
+                print_dlz("WebDriver initialized successfully.")
             except Exception as e:
                 print(f"Error initializing WebDriver: {e}")
                 self.driver = None
@@ -126,7 +142,7 @@ class NationalbankenScraper:
         if self.driver:
             self.driver.quit()
             self.driver = None
-            print("WebDriver closed.")
+            print_dlz("WebDriver closed.")
 
     def find_in_shadow_root(self, host_css_selector, shadow_css_selector):
         '''Find element within a shadow root using JavaScript execution.'''
@@ -217,7 +233,7 @@ class NationalbankenScraper:
                 WebDriverWait(self.driver, 10).until(
                     EC.invisibility_of_element_located((By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"))
                 )
-                print("Cookie dialog disappeared from regular DOM.")
+                print_dlz("Cookie dialog disappeared from regular DOM.")
                 
             except Exception as dom_error:
                 print(f"Cookie dialog not found in regular DOM: {dom_error}")
@@ -234,7 +250,7 @@ class NationalbankenScraper:
             return True
         
         except Exception as e:
-            print(f"Error during cookie acceptance process: {e}")
+            print_dlz(f"Error during cookie acceptance process: {e}")
             print("Continuing without accepting cookies.")
             return False
 
@@ -313,7 +329,7 @@ class NationalbankenScraper:
             with open(filepath, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print(f"Downloaded {safe_filename}")
+            print_dlz(f"Downloaded {safe_filename}")
             # Compute and save MD5
             md5_hash = compute_md5(filepath)
             if md5_hash:
@@ -602,7 +618,7 @@ class NationalbankenScraper:
         try:
             with open(metadata_filename, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=4, ensure_ascii=False)
-            print(f"Metadata for page {page_num} saved to {metadata_filename}")
+            print_dlz(f"Metadata for page {page_num} saved to {metadata_filename}")
             self.sent_files.add(metadata_filename)
         except Exception as e:
             print(f"Error saving metadata for page {page_num}: {e}")
@@ -641,11 +657,11 @@ class NationalbankenScraper:
                 
             while True:
                 if page_num > self.MAX_PAGES_TO_SCRAPE:
-                    print(f"Reached max page limit ({self.MAX_PAGES_TO_SCRAPE}), stopping.")
+                    print_dlz(f"Reached max page limit ({self.MAX_PAGES_TO_SCRAPE}), stopping.")
                     break
 
                 current_search_url = f"{self.START_URL}?page={page_num}" if page_num > 1 else self.START_URL
-                print(f"Processing search page: {current_search_url}")
+                print_dlz(f"Processing search page: {current_search_url}")
                 
                 # Load the search page
                 self.driver.get(current_search_url)
@@ -673,7 +689,7 @@ class NationalbankenScraper:
                 # Store the metadata for each page separately
                 page_metadata = []
                 
-                print("Extracting article metadata from search results...")
+                print_dlz("Extracting article metadata from search results...")
                 for item in result_items:
                     # Extract attributes from the shadow DOM element
                     attrs = self.extract_attributes_from_shadow_element(item)
@@ -718,7 +734,7 @@ class NationalbankenScraper:
                     })
                     found_new_articles_on_page = True
 
-                print(f"Articles found on page: {[a['url'] for a in page_articles]}")
+                print_dlz(f"Articles found on page: {[a['url'] for a in page_articles]}")
 
                 # Now visit each article URL one by one
                 for article in page_articles:
@@ -790,7 +806,7 @@ class NationalbankenScraper:
                             if href and not any((isinstance(l, dict) and l.get('href') == href) or (hasattr(l, 'get_attribute') and l.get_attribute('href') == href) for l in all_pdf_links):
                                 all_pdf_links.append(link)
 
-                    print(f"Found {len(all_pdf_links)} total potential PDF links")
+                    print_dlz(f"Found {len(all_pdf_links)} total potential PDF links")
 
                     pdf_found_for_article = False
                     for pdf_link in all_pdf_links:
@@ -870,12 +886,11 @@ def main():
     with NationalbankenScraper() as scraper:
         files_to_send = scraper.run()
 
-    if files_to_send:
+    if files_to_send and ON_DLZ:
         for fpath in files_to_send:
-            pass
-            #print(f"Sending file {fpath}")
-            #dlz.send_file_created(fpath)
+            print(f"Sending file {fpath}")
+            dlz.send_file_created(fpath)
 
-if __name__ == "__main__":
-    main()
+#if __name__ == "__main__":
+main()
 
