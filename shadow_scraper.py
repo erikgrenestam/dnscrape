@@ -139,7 +139,7 @@ class NationalbankenScraper:
         """
         self.dlz = dlz_instance
         self.driver = None
-        self.sent_files = set()
+        self.files_to_send = {}
         self.all_metadata = []
         self.processed_article_urls = set()
 
@@ -307,6 +307,17 @@ class NationalbankenScraper:
         except Exception as e:
             print(f"Error extracting attributes: {e}")
             return {}
+        
+    def compute_md5(self, path):
+        hash_md5 = hashlib.md5()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except Exception as e:
+            print(f"Error computing MD5 for {path}: {e}")
+            return None
 
     def download_pdf(self, pdf_url, filename):
         '''Downloads a PDF from a URL to a local file, saves an MD5 file, and skips download if file with matching MD5 exists.'''
@@ -320,20 +331,9 @@ class NationalbankenScraper:
         filepath = os.path.join(self.DOCS_DIR, safe_filename)
         md5_filepath = filepath + ".md5"
 
-        def compute_md5(path):
-            hash_md5 = hashlib.md5()
-            try:
-                with open(path, "rb") as f:
-                    for chunk in iter(lambda: f.read(4096), b""):
-                        hash_md5.update(chunk)
-                return hash_md5.hexdigest()
-            except Exception as e:
-                print(f"Error computing MD5 for {path}: {e}")
-                return None
-
         # If file exists, check MD5
         if os.path.exists(filepath) and os.path.exists(md5_filepath):
-            existing_md5 = compute_md5(filepath)
+            existing_md5 = self.compute_md5(filepath)
             try:
                 with open(md5_filepath, "r", encoding="utf-8") as f:
                     saved_md5 = f.read().strip()
@@ -344,8 +344,8 @@ class NationalbankenScraper:
                 print(
                     f"File {safe_filename} already exists and MD5 matches. Skipping download."
                 )
-                self.sent_files.add(filepath)
-                self.sent_files.add(md5_filepath)
+                #self.files_to_send.add(filepath)
+                #self.files_to_send.add(md5_filepath)
                 return existing_md5
             else:
                 print(
@@ -368,15 +368,14 @@ class NationalbankenScraper:
             with open(filepath, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print_dlz(f"Downloaded {safe_filename}")
+            #print_dlz(f"Downloaded {safe_filename}")
             # Compute and save MD5
-            md5_hash = compute_md5(filepath)
+            md5_hash = self.compute_md5(filepath)
             if md5_hash:
                 with open(md5_filepath, "w", encoding="utf-8") as f:
                     f.write(md5_hash)
                 print(f"MD5 hash saved to {md5_filepath}")
-            self.sent_files.add(filepath)
-            self.sent_files.add(md5_filepath)
+            self.files_to_send[filepath] = md5_hash
             return md5_hash
         except requests.exceptions.RequestException as e:
             print(f"Error downloading {pdf_url}: {e}")
@@ -685,7 +684,10 @@ class NationalbankenScraper:
                 writer.writeheader()
                 for row in self.all_metadata:
                     writer.writerow(row)
-            self.sent_files.add(csv_file)
+
+            md5_hash = self.compute_md5(csv_file)
+            
+            self.files_to_send[csv_file] = md5_hash
             print_dlz(
                 "Metadata for {} PDFs saved to {}".format(
                     len(self.all_metadata), self.METADATA_FILE
@@ -694,7 +696,7 @@ class NationalbankenScraper:
         else:
             print_dlz("No PDFs were downloaded, so no metadata file created.")
 
-    def run(self):
+    def run(self) -> dict:
         """
         Main method to run the scraper.
         
@@ -707,247 +709,246 @@ class NationalbankenScraper:
         page_num = 1
         first_page = True
 
-        try:
-            if not self.driver:
-                print_dlz("WebDriver not initialized. Exiting.")
-                return []
-                
-            while True:
-                if page_num > self.MAX_PAGES_TO_SCRAPE:
-                    print_dlz(f"Reached max page limit ({self.MAX_PAGES_TO_SCRAPE}), stopping.")
-                    break
+        if not self.driver:
+            print_dlz("WebDriver not initialized. Exiting.")
+            return {}
+            
+        while True:
+            if page_num > self.MAX_PAGES_TO_SCRAPE:
+                print_dlz(f"Reached max page limit ({self.MAX_PAGES_TO_SCRAPE}), stopping.")
+                break
 
-                current_search_url = f"{self.START_URL}?page={page_num}" if page_num > 1 else self.START_URL
-                print_dlz(f"Processing search page: {current_search_url}")
+            current_search_url = f"{self.START_URL}?page={page_num}" if page_num > 1 else self.START_URL
+            print_dlz(f"Processing search page: {current_search_url}")
+            
+            # Load the search page
+            self.driver.get(current_search_url)
+            time.sleep(3)
+            
+            # Accept cookies if needed
+            if page_num == 1 or first_page:
+                self.accept_cookies()
+            
+            # Find search result items in shadow DOM
+            result_items = self.find_elements_in_all_shadow_roots("dnb-search-result-item")
+            
+            if not result_items:
+                if page_num == 1:
+                    print("No search results found on the first page. Exiting.")
+                else:
+                    print("No more search results found. End of results.")
+                break
+            print(f"Found {len(result_items)} search result items on page {page_num}")
+            
+            # First, extract all article data and URLs from the search page
+            page_articles = []
+            found_new_articles_on_page = False
+            
+            # Store the metadata for each page separately
+            page_metadata = []
+            
+            print_dlz("Extracting article metadata from search results...")
+            for item in result_items:
+                # Extract attributes from the shadow DOM element
+                attrs = self.extract_attributes_from_shadow_element(item)
                 
-                # Load the search page
-                self.driver.get(current_search_url)
-                time.sleep(3)
+                # Get article information
+                article_title = attrs.get('header', 'N/A').strip()
+                content_type = attrs.get('content-type', '')
+                topic = attrs.get('topic', '')
+                date = attrs.get('date', '')
+                description = attrs.get('description', '')
                 
-                # Accept cookies if needed
-                if page_num == 1 or first_page:
-                    self.accept_cookies()
+                # Extract URL from link attribute (which is a JSON string)
+                link_json_str = attrs.get('link', '{}')
+                article_url = None
                 
-                # Find search result items in shadow DOM
-                result_items = self.find_elements_in_all_shadow_roots("dnb-search-result-item")
+                try:
+                    link_data = json.loads(link_json_str)
+                    raw_url = link_data.get('url')
+                    if (raw_url):
+                        article_url = urljoin(self.BASE_URL, raw_url)
+                except json.JSONDecodeError:
+                    print(f"  Error decoding link JSON for item '{article_title}': {link_json_str}")
                 
-                if not result_items:
-                    if page_num == 1:
-                        print("No search results found on the first page. Exiting.")
+                # If no URL found, skip this item
+                if not article_url:
+                    print(f"Could not find a valid URL for item: {article_title}")
+                    continue
+                
+                # Skip if already processed
+                if article_url in self.processed_article_urls:
+                    print(f"  Skipping already processed article: {article_title}")
+                    continue
+                
+                # Store the article metadata for later processing
+                page_articles.append({
+                    'url': article_url,
+                    'title': article_title,
+                    'content_type': content_type,
+                    'topic': topic,
+                    'date': date,
+                    'description': description
+                })
+                found_new_articles_on_page = True
+
+            print_dlz(f"Articles found on page: {[a['url'] for a in page_articles]}")
+
+            # Now visit each article URL one by one
+            for article in page_articles:
+                article_url = article['url']
+                article_title = article['title']
+                
+                self.processed_article_urls.add(article_url)
+                print(f"  Visiting article page: {article_title} ({article_url})")
+                # Load the article page
+                self.driver.get(article_url)
+
+                WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.CLASS_NAME, "h2"))
+                )
+                time.sleep(2)  # Wait for page to load
+                
+                # Analyze the shadow DOM structure to better understand the page
+                shadow_structure = self.analyze_shadow_dom_structure()
+                
+                # First try to use the PDF links we found from our shadow DOM analysis
+                pdf_links = []
+                pdf_links_from_analysis = shadow_structure.get('pdfLinks', [])
+                
+                if pdf_links_from_analysis:
+                    #print(f"Found {len(pdf_links_from_analysis)} PDF links from shadow DOM analysis")
+                    
+                    # Convert the analyzed links to objects that can be used like WebElements
+                    for link_info in pdf_links_from_analysis:
+                        href = link_info.get('href')
+                        if href and (href.lower().endswith('.pdf') or link_info.get('hasDownload')):
+                            # Create a dictionary that mimics a WebElement with properties we need
+                            link_obj = {
+                                'href': href,
+                                'text': link_info.get('text'),
+                                'getAttribute': lambda attr, h=href: h if attr == 'href' else None
+                            }
+                            pdf_links.append(link_obj)
+                
+                # If no PDF links found through analysis, try regular DOM
+                if not pdf_links:
+                    regular_pdf_links = self.driver.find_elements(By.CSS_SELECTOR, "a.related-card__link[download], a[href$='.pdf']")
+                    
+                    if regular_pdf_links:
+                        pdf_links = regular_pdf_links
                     else:
-                        print("No more search results found. End of results.")
-                    break
-                print(f"Found {len(result_items)} search result items on page {page_num}")
+                        # If still nothing found, try our custom shadow DOM search
+                        shadow_selectors = [
+                            "a.related-card__link[download]",
+                            "a.related-card__link[href$='.pdf']",
+                            "a[download]", 
+                            "a[href$='.pdf']",
+                            "a[href*='.pdf']"
+                        ]
+                        
+                        for selector in shadow_selectors:
+                            pdf_links_in_shadow = self.find_elements_in_all_shadow_roots(selector)
+                            if pdf_links_in_shadow:
+                                pdf_links = pdf_links_in_shadow
+                                break
                 
-                # First, extract all article data and URLs from the search page
-                page_articles = []
-                found_new_articles_on_page = False
+                custom_pdf_links = self.extract_pdf_links_from_custom_elements()
                 
-                # Store the metadata for each page separately
-                page_metadata = []
-                
-                print_dlz("Extracting article metadata from search results...")
-                for item in result_items:
-                    # Extract attributes from the shadow DOM element
-                    attrs = self.extract_attributes_from_shadow_element(item)
-                    
-                    # Get article information
-                    article_title = attrs.get('header', 'N/A').strip()
-                    content_type = attrs.get('content-type', '')
-                    topic = attrs.get('topic', '')
-                    date = attrs.get('date', '')
-                    description = attrs.get('description', '')
-                    
-                    # Extract URL from link attribute (which is a JSON string)
-                    link_json_str = attrs.get('link', '{}')
-                    article_url = None
-                    
+                all_pdf_links = []
+                if pdf_links:
+                    all_pdf_links.extend(pdf_links)
+                if custom_pdf_links:
+                    for link in custom_pdf_links:
+                        href = link.get('href')
+                        if href and not any((isinstance(l, dict) and l.get('href') == href) or (hasattr(l, 'get_attribute') and l.get_attribute('href') == href) for l in all_pdf_links):
+                            all_pdf_links.append(link)
+
+                #print_dlz(f"Found {len(all_pdf_links)} total potential PDF links")
+
+                pdf_found_for_article = False
+                for pdf_link in all_pdf_links:
                     try:
-                        link_data = json.loads(link_json_str)
-                        raw_url = link_data.get('url')
-                        if (raw_url):
-                            article_url = urljoin(self.BASE_URL, raw_url)
-                    except json.JSONDecodeError:
-                        print(f"  Error decoding link JSON for item '{article_title}': {link_json_str}")
-                    
-                    # If no URL found, skip this item
-                    if not article_url:
-                        print(f"Could not find a valid URL for item: {article_title}")
-                        continue
-                    
-                    # Skip if already processed
-                    if article_url in self.processed_article_urls:
-                        print(f"  Skipping already processed article: {article_title}")
-                        continue
-                    
-                    # Store the article metadata for later processing
-                    page_articles.append({
-                        'url': article_url,
-                        'title': article_title,
-                        'content_type': content_type,
-                        'topic': topic,
-                        'date': date,
-                        'description': description
-                    })
-                    found_new_articles_on_page = True
-
-                print_dlz(f"Articles found on page: {[a['url'] for a in page_articles]}")
-
-                # Now visit each article URL one by one
-                for article in page_articles:
-                    article_url = article['url']
-                    article_title = article['title']
-                    
-                    self.processed_article_urls.add(article_url)
-                    print(f"  Visiting article page: {article_title} ({article_url})")
-                    # Load the article page
-                    self.driver.get(article_url)
-
-                    WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((By.CLASS_NAME, "h2"))
-                    )
-                    time.sleep(2)  # Wait for page to load
-                    
-                    # Analyze the shadow DOM structure to better understand the page
-                    shadow_structure = self.analyze_shadow_dom_structure()
-                    
-                    # First try to use the PDF links we found from our shadow DOM analysis
-                    pdf_links = []
-                    pdf_links_from_analysis = shadow_structure.get('pdfLinks', [])
-                    
-                    if pdf_links_from_analysis:
-                        #print(f"Found {len(pdf_links_from_analysis)} PDF links from shadow DOM analysis")
-                        
-                        # Convert the analyzed links to objects that can be used like WebElements
-                        for link_info in pdf_links_from_analysis:
-                            href = link_info.get('href')
-                            if href and (href.lower().endswith('.pdf') or link_info.get('hasDownload')):
-                                # Create a dictionary that mimics a WebElement with properties we need
-                                link_obj = {
-                                    'href': href,
-                                    'text': link_info.get('text'),
-                                    'getAttribute': lambda attr, h=href: h if attr == 'href' else None
-                                }
-                                pdf_links.append(link_obj)
-                    
-                    # If no PDF links found through analysis, try regular DOM
-                    if not pdf_links:
-                        regular_pdf_links = self.driver.find_elements(By.CSS_SELECTOR, "a.related-card__link[download], a[href$='.pdf']")
-                        
-                        if regular_pdf_links:
-                            pdf_links = regular_pdf_links
+                        pdf_href = None
+                        if isinstance(pdf_link, dict) and 'href' in pdf_link:
+                            pdf_href = pdf_link['href']
+                            print(f"Processing PDF link: {pdf_href}")
+                        elif hasattr(pdf_link, 'get_attribute'):
+                            pdf_href = pdf_link.get_attribute('href')
+                            if not pdf_href:
+                                pdf_href = self.driver.execute_script("return arguments[0].href || arguments[0].getAttribute('href');", pdf_link)
                         else:
-                            # If still nothing found, try our custom shadow DOM search
-                            shadow_selectors = [
-                                "a.related-card__link[download]",
-                                "a.related-card__link[href$='.pdf']",
-                                "a[download]", 
-                                "a[href$='.pdf']",
-                                "a[href*='.pdf']"
-                            ]
-                            
-                            for selector in shadow_selectors:
-                                pdf_links_in_shadow = self.find_elements_in_all_shadow_roots(selector)
-                                if pdf_links_in_shadow:
-                                    pdf_links = pdf_links_in_shadow
-                                    break
-                    
-                    custom_pdf_links = self.extract_pdf_links_from_custom_elements()
-                    
-                    all_pdf_links = []
-                    if pdf_links:
-                        all_pdf_links.extend(pdf_links)
-                    if custom_pdf_links:
-                        for link in custom_pdf_links:
-                            href = link.get('href')
-                            if href and not any((isinstance(l, dict) and l.get('href') == href) or (hasattr(l, 'get_attribute') and l.get_attribute('href') == href) for l in all_pdf_links):
-                                all_pdf_links.append(link)
-
-                    print_dlz(f"Found {len(all_pdf_links)} total potential PDF links")
-
-                    pdf_found_for_article = False
-                    for pdf_link in all_pdf_links:
-                        try:
-                            pdf_href = None
-                            if isinstance(pdf_link, dict) and 'href' in pdf_link:
-                                pdf_href = pdf_link['href']
-                                print(f"Processing PDF link: {pdf_href}")
-                            elif hasattr(pdf_link, 'get_attribute'):
-                                pdf_href = pdf_link.get_attribute('href')
-                                if not pdf_href:
-                                    pdf_href = self.driver.execute_script("return arguments[0].href || arguments[0].getAttribute('href');", pdf_link)
+                            try:
+                                pdf_href = self.driver.execute_script("return arguments[0].href || arguments[0].getAttribute('href');", pdf_link)
+                            except Exception:
+                                print(f"    Cannot extract href from {type(pdf_link)}")
+                        if pdf_href and pdf_href.lower().endswith(".pdf"):
+                            full_pdf_url = urljoin(self.BASE_URL, pdf_href)
+                            parsed_pdf_url = urlparse(full_pdf_url)
+                            pdf_filename = os.path.basename(parsed_pdf_url.path)
+                            if not pdf_filename:
+                                print(f"Could not determine filename for PDF: {full_pdf_url}")
+                                continue
+                            print(f"Found PDF: {full_pdf_url}")
+                            md5_hash = self.download_pdf(full_pdf_url, pdf_filename)
+                            if md5_hash:
+                                metadata = {
+                                    "source_page_url": article_url,
+                                    "pdf_url": full_pdf_url,
+                                    "downloaded_filename": pdf_filename,
+                                    "title": article['title'],
+                                    "date": article['date'],
+                                    "content_type": article['content_type'],
+                                    "topic": article['topic'],
+                                    "description": article['description'],
+                                    "file_md5": md5_hash
+                                }
+                                self.all_metadata.append(metadata)
+                                page_metadata.append(metadata)
+                                pdf_found_for_article = True
                             else:
-                                try:
-                                    pdf_href = self.driver.execute_script("return arguments[0].href || arguments[0].getAttribute('href');", pdf_link)
-                                except Exception:
-                                    print(f"    Cannot extract href from {type(pdf_link)}")
-                            if pdf_href and pdf_href.lower().endswith(".pdf"):
-                                full_pdf_url = urljoin(self.BASE_URL, pdf_href)
-                                parsed_pdf_url = urlparse(full_pdf_url)
-                                pdf_filename = os.path.basename(parsed_pdf_url.path)
-                                if not pdf_filename:
-                                    print(f"Could not determine filename for PDF: {full_pdf_url}")
-                                    continue
-                                print(f"Found PDF: {full_pdf_url}")
-                                md5_hash = self.download_pdf(full_pdf_url, pdf_filename)
-                                if md5_hash:
-                                    metadata = {
-                                        "source_page_url": article_url,
-                                        "pdf_url": full_pdf_url,
-                                        "downloaded_filename": pdf_filename,
-                                        "title": article['title'],
-                                        "date": article['date'],
-                                        "content_type": article['content_type'],
-                                        "topic": article['topic'],
-                                        "description": article['description'],
-                                        "file_md5": md5_hash
-                                    }
-                                    self.all_metadata.append(metadata)
-                                    page_metadata.append(metadata)
-                                    pdf_found_for_article = True
-                                else:
-                                    print(f"    Failed to download {pdf_filename}")
-                        except Exception as e:
-                            print(f"Error processing PDF link: {e}")
-                    if not pdf_found_for_article:
-                        print(
-                            "No PDF download link found on article page: "
-                            f"{article_url}"
-                        )
-                
-                #self.save_metadata_per_page(page_metadata, page_num)
-                
-                if not found_new_articles_on_page and page_num > 1:
+                                print(f"    Failed to download {pdf_filename}")
+                    except Exception as e:
+                        print(f"Error processing PDF link: {e}")
+                if not pdf_found_for_article:
                     print(
-                        "No new articles found on this page, stopping pagination."
+                        "No PDF download link found on article page: "
+                        f"{article_url}"
                     )
-                    break
-                
-                page_num += 1
-                first_page = False
+            
+            #self.save_metadata_per_page(page_metadata, page_num)
+            
+            if not found_new_articles_on_page and page_num > 1:
+                print(
+                    "No new articles found on this page, stopping pagination."
+                )
+                break
+            
+            page_num += 1
+            first_page = False
 
-        except KeyboardInterrupt:
-            print("\nScraping interrupted by user.")
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-        finally:
-            print(
-                "Browser window left open for inspection. "
-                "Close it manually when done."
-            )
-            return list(self.sent_files)
+        print(
+            "Browser window left open for inspection. "
+            "Close it manually when done."
+        )
+        return self.files_to_send
 
 
 def main():
     """Main function to run the scraper."""
     with NationalbankenScraper() as scraper:
         scraper.run()
-    files_to_send = list(scraper.sent_files)  # Collect after context manager
+    files_to_send = scraper.files_to_send  # Collect after context manager
 
     if files_to_send and ON_DLZ:
-        for fpath in files_to_send:
-            print_dlz(f"Sending file {fpath}")
-            dlz.send_file_created(fpath)
+        dlz.get_previous_files(['filehash'])
+        
+        for fpath, fhash in files_to_send.items():
+            if dlz.is_new_file(fpath, {'filehash': fhash}):
+                print_dlz(f"Sending file {fpath}")
+                dlz.send_file_created(fpath, custom_json_data={'filehash': fhash})
+            else:
+                print_dlz(f"File {fpath} already downloaded, skipping send.")
 
 
 #if __name__ == "__main__":
